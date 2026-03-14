@@ -1,31 +1,59 @@
 """
-DQN Agent for Tetris — Built from scratch
+Double Dueling DQN Agent for Tetris
 
-Components:
-  1. Replay Buffer — uniform random sampling from fixed-capacity deque
-  2. Q-Network — CNN backbone (board) + MLP embeddings (pieces, features) → FC head
-  3. Epsilon-greedy — linear decay with action masking
-  4. Target Network — frozen copy, hard-synced every K steps
+Improvements over vanilla DQN:
+
+1. DOUBLE DQN (van Hasselt et al., 2016)
+   Fixes overestimation bias in the Bellman target.
+
+   Vanilla DQN target:
+     y = r + γ · max_a' Q_θ⁻(s', a')
+
+   The max uses θ⁻ for BOTH selecting and evaluating the best action.
+   When Q-values are noisy, max systematically picks overestimated values:
+     E[max(X₁, X₂, ..., Xₙ)] ≥ max(E[X₁], E[X₂], ..., E[Xₙ])
+   This is Jensen's inequality applied to the max function (convex).
+   The bias compounds through the Bellman backup chain.
+
+   Double DQN decouples selection from evaluation:
+     a* = argmax_a' Q_θ(s', a')        ← online net SELECTS
+     y  = r + γ · Q_θ⁻(s', a*)         ← target net EVALUATES
+
+   Since θ and θ⁻ have independent noise (different training checkpoints),
+   the overestimation bias largely cancels.
+
+2. DUELING ARCHITECTURE (Wang et al., 2016)
+   Decomposes Q(s,a) into value and advantage:
+
+     Q(s, a) = V(s) + A(s, a) - mean_a' A(s, a')
+
+   V(s):    How good is this board state? (shared across all actions)
+   A(s, a): How much better is this placement than average?
+
+   Why this helps for Tetris:
+   - Many board states have similar value regardless of action (an empty
+     board is good no matter what piece you drop). V captures this.
+   - The A stream focuses on what makes specific placements better,
+     which is a much narrower learning problem.
+   - With 96 actions (many masked), the agent sees each action rarely.
+     V generalizes across all actions, so even unseen actions get
+     reasonable Q-values through the shared V component.
+
+   The mean subtraction is an identifiability constraint:
+     Without it, V and A are not unique — you could add constant c to V
+     and subtract c from every A(s,a). The mean subtraction forces
+     mean_a A(s,a) = 0, making V the true state value E_π[return|s].
 
 Architecture:
-  The Q-network processes three types of input:
+  CNN backbone:  board (1, 20, 10)   → 3 conv layers  → 3200-dim
+  Piece embed:   piece_info (22,)    → Linear+ReLU    → 64-dim
+  Feature embed: board_features (34,) → Linear+ReLU   → 64-dim
 
-    CNN path:   board (1, 20, 10)  →  Conv layers  →  3200-dim spatial features
-    MLP path 1: piece_info (22,)   →  Linear+ReLU  →  64-dim piece embedding
-    MLP path 2: board_features (34,) → Linear+ReLU →  64-dim feature embedding
+  Combined (3328) splits into:
+    Value stream:     3328 → 256 → 1    (state value)
+    Advantage stream: 3328 → 256 → 96   (per-action advantage)
 
-    Combined:   [3200 + 64 + 64 = 3328]  →  FC(512) → FC(96) Q-values
-
-  Why three separate input paths?
-    - The board is SPATIAL data → CNN (weight sharing, translation equivariance)
-    - Piece identity is CATEGORICAL → embedding layer (like NLP word embeddings)
-    - Board features are PRE-COMPUTED STATISTICS → MLP (direct numerical reasoning)
-
-  The board features (holes, heights, etc.) are redundant with the raw board
-  in theory — the CNN could learn to compute them. In practice, the CNN
-  learns these features slowly, so providing them explicitly gives the
-  agent a huge head start. The CNN then focuses on learning patterns the
-  hand-crafted features miss (e.g., specific piece-shaped gaps, T-spin setups).
+  Q = V + A - mean(A)
 """
 
 import torch
@@ -38,8 +66,7 @@ import random
 from tetris_env import MAX_ACTIONS, NUM_PIECES, BOARD_FEATURES_SIZE
 
 
-# Piece info size: current(7) + next(7) + hold(7) + can_hold(1) = 22
-PIECE_INFO_SIZE = NUM_PIECES * 3 + 1
+PIECE_INFO_SIZE = NUM_PIECES * 3 + 1  # 22
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -47,12 +74,7 @@ PIECE_INFO_SIZE = NUM_PIECES * 3 + 1
 # ══════════════════════════════════════════════════════════════════════
 
 class ReplayBuffer:
-    """
-    Fixed-capacity buffer with uniform random sampling.
-
-    Stores transitions as (state_dict, action, reward, next_state_dict, done).
-    At sample time, extracts and stacks each component into batch tensors.
-    """
+    """Fixed-capacity buffer with uniform random sampling."""
 
     def __init__(self, capacity: int = 100_000):
         self.buffer = deque(maxlen=capacity)
@@ -89,32 +111,37 @@ class ReplayBuffer:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Q-NETWORK
+#  DUELING Q-NETWORK
 # ══════════════════════════════════════════════════════════════════════
 
-class QNetwork(nn.Module):
+class DuelingQNetwork(nn.Module):
     """
-    Q-value network with three input streams:
+    Dueling architecture: shared features → split into V and A streams.
 
-    1. CNN backbone for spatial board features
-       Conv(1→32) + BN + ReLU → Conv(32→64) + BN + ReLU → Conv(64→64, stride=2) + BN + ReLU
-       Output: 64 × 10 × 5 = 3200
+    Shared backbone:
+      CNN:   (1, 20, 10) → Conv+BN+ReLU ×3 (last stride=2) → 3200
+      Piece: (22,) → Linear+ReLU → 64
+      Feats: (34,) → Linear+ReLU → 64
+      Combined: 3328
 
-    2. Piece embedding for categorical piece identity
-       Linear(22→64) + ReLU
-       Output: 64
+    Dueling split:
+      Value stream:     3328 → 256 → ReLU → 1     →  V(s)
+      Advantage stream: 3328 → 256 → ReLU → 96    →  A(s, a)
 
-    3. Board feature embedding for engineered statistics
-       Linear(34→64) + ReLU
-       Output: 64
+    Output:
+      Q(s, a) = V(s) + A(s, a) - mean_a'[A(s, a')]
 
-    Combined: 3328 → Linear(512) + ReLU → Linear(96)
+    Why 256 per stream instead of 512 for a single head?
+      Total params ≈ same (3328×256×2 ≈ 3328×512). But the split forces
+      the network to explicitly separate "how good is this state" from
+      "how good is this action," which is a better inductive bias for
+      games where many actions have similar value.
     """
 
     def __init__(self):
         super().__init__()
 
-        # ── CNN backbone ──────────────────────────────────────────────
+        # ── Shared backbone ───────────────────────────────────────────
         self.conv = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
@@ -126,26 +153,38 @@ class QNetwork(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(),
         )
-        # (1, 20, 10) → stride-2 → (64, 10, 5) → flatten → 3200
-        self._conv_out = 64 * 10 * 5
+        self._conv_out = 64 * 10 * 5  # 3200
 
-        # ── Piece embedding ───────────────────────────────────────────
         self.piece_embed = nn.Sequential(
             nn.Linear(PIECE_INFO_SIZE, 64),
             nn.ReLU(),
         )
 
-        # ── Board features embedding ─────────────────────────────────
         self.feat_embed = nn.Sequential(
             nn.Linear(BOARD_FEATURES_SIZE, 64),
             nn.ReLU(),
         )
 
-        # ── Decision head ─────────────────────────────────────────────
-        self.head = nn.Sequential(
-            nn.Linear(self._conv_out + 64 + 64, 512),
+        combined_size = self._conv_out + 64 + 64  # 3328
+
+        # ── Value stream: "how good is this state?" ───────────────────
+        # Outputs a single scalar V(s).
+        # This stream answers: "given this board, piece, and features,
+        # what is the expected return regardless of which action I take?"
+        self.value_stream = nn.Sequential(
+            nn.Linear(combined_size, 256),
             nn.ReLU(),
-            nn.Linear(512, MAX_ACTIONS),
+            nn.Linear(256, 1),
+        )
+
+        # ── Advantage stream: "how much better is this action?" ───────
+        # Outputs A(s, a) for each of 96 actions.
+        # After mean subtraction, A represents the relative advantage
+        # of each placement over the average placement.
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(combined_size, 256),
+            nn.ReLU(),
+            nn.Linear(256, MAX_ACTIONS),
         )
 
     def forward(self, board, piece_info, board_features):
@@ -155,31 +194,51 @@ class QNetwork(nn.Module):
             piece_info:     (batch, 22)
             board_features: (batch, 34)
         Returns:
-            q_values:       (batch, 96)
+            q_values:       (batch, 96) = V + A - mean(A)
         """
+        # Shared feature extraction
         x = self.conv(board).view(board.size(0), -1)
         p = self.piece_embed(piece_info)
         f = self.feat_embed(board_features)
-        return self.head(torch.cat([x, p, f], dim=1))
+        combined = torch.cat([x, p, f], dim=1)
+
+        # Dueling streams
+        v = self.value_stream(combined)            # (batch, 1)
+        a = self.advantage_stream(combined)        # (batch, 96)
+
+        # Q = V + (A - mean(A))
+        # The mean subtraction ensures A is centered at 0.
+        # This makes V ≈ E[Q(s, ·)] and A ≈ Q(s, a) - E[Q(s, ·)]
+        q = v + a - a.mean(dim=1, keepdim=True)
+        return q
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  DQN AGENT
+#  DOUBLE DUELING DQN AGENT
 # ══════════════════════════════════════════════════════════════════════
 
 class DQNAgent:
     """
-    DQN with replay buffer, target network, and masked ε-greedy.
+    Double Dueling DQN with replay buffer and masked ε-greedy.
 
-    Epsilon schedule (linear decay):
-        ε(t) = ε_start + (ε_end - ε_start) · min(1, t / T)
+    The two improvements work synergistically:
+    - Dueling: better Q-value estimates (especially for rarely-seen actions)
+    - Double: unbiased targets from those better estimates
 
-    Target network (hard sync every K steps):
-        θ⁻ ← θ  every K gradient steps
+    Training objective (Double DQN):
+        a* = argmax_{a'∈valid(s')} Q_θ(s', a')      ← online net selects
+        y  = r + γ(1-done) · Q_θ⁻(s', a*)           ← target net evaluates
+        L  = Huber(Q_θ(s,a) - y)
 
-    Training objective:
-        y = r + γ(1-done) · max_{a'∈valid(s')} Q_θ⁻(s', a')
-        L = Huber(Q_θ(s,a) - y)
+    Compare to vanilla DQN:
+        y  = r + γ(1-done) · max_{a'∈valid(s')} Q_θ⁻(s', a')
+
+    The difference is subtle but important:
+    - Vanilla: target net both picks AND scores the best next action
+    - Double: online net picks, target net scores
+
+    This reduces overestimation because the selection noise (from θ)
+    and evaluation noise (from θ⁻) are independent.
     """
 
     def __init__(
@@ -198,8 +257,9 @@ class DQNAgent:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
 
-        self.q_net = QNetwork().to(self.device)
-        self.target_net = QNetwork().to(self.device)
+        # Both networks use the Dueling architecture
+        self.q_net = DuelingQNetwork().to(self.device)
+        self.target_net = DuelingQNetwork().to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.target_net.eval()
 
@@ -215,7 +275,6 @@ class DQNAgent:
         self.replay_buffer = ReplayBuffer(buffer_size)
         self.steps_done = 0
 
-        # Training stats for logging
         self.train_stats = {
             "loss": 0.0,
             "q_mean": 0.0,
@@ -247,7 +306,23 @@ class DQNAgent:
             return q.argmax().item()
 
     def train_step(self) -> float | None:
-        """One gradient step. Returns loss or None if buffer too small."""
+        """
+        One Double DQN gradient step.
+
+        Key difference from vanilla DQN (marked with ★):
+
+        Vanilla:
+          next_q = Q_θ⁻(s', ·)
+          max_next_q = max_a' next_q[a']
+
+        Double:
+          ★ online_next_q = Q_θ(s', ·)              ← online net
+          ★ best_actions = argmax_a' online_next_q   ← online SELECTS
+          ★ next_q = Q_θ⁻(s', ·)                    ← target net
+          ★ max_next_q = next_q[best_actions]        ← target EVALUATES
+
+        Everything else (loss, optimization, target sync) is identical.
+        """
         if len(self.replay_buffer) < self.batch_size:
             return None
 
@@ -264,18 +339,35 @@ class DQNAgent:
         rewards = batch["rewards"].to(self.device)
         dones = batch["dones"].to(self.device)
 
-        # Q_θ(s, a) for taken actions
+        # ── Current Q-values ──────────────────────────────────────────
         all_q = self.q_net(boards, pieces, feats)
         q_values = all_q.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-        # Masked Bellman target
+        # ── Double DQN target ─────────────────────────────────────────
         with torch.no_grad():
-            next_q = self.target_net(next_boards, next_pieces, next_feats)
-            next_q[next_masks == 0] = -float("inf")
-            max_next_q = next_q.max(dim=1)[0]
+            # ★ Step 1: Online network SELECTS the best next action
+            # We use the online net (not the target) to choose which
+            # action is best. This breaks the coupling between selection
+            # and evaluation that causes overestimation.
+            online_next_q = self.q_net(next_boards, next_pieces, next_feats)
+            online_next_q[next_masks == 0] = -float("inf")
+            best_next_actions = online_next_q.argmax(dim=1)  # (batch,)
+
+            # ★ Step 2: Target network EVALUATES that action
+            # The target net provides the Q-value for the action the
+            # online net selected. Since θ and θ⁻ have independent noise,
+            # the overestimation bias is greatly reduced.
+            target_next_q = self.target_net(
+                next_boards, next_pieces, next_feats)
+            max_next_q = target_next_q.gather(
+                1, best_next_actions.unsqueeze(1)).squeeze(1)
+
+            # For terminal states (all actions masked), clamp to 0
             max_next_q = torch.clamp(max_next_q, min=0.0)
+
             targets = rewards + self.gamma * max_next_q * (1 - dones)
 
+        # ── Loss and optimization ─────────────────────────────────────
         loss = nn.functional.smooth_l1_loss(q_values, targets)
 
         self.optimizer.zero_grad()
@@ -288,7 +380,7 @@ class DQNAgent:
         if self.steps_done % self.target_update == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())
 
-        # Stats
+        # ── Stats ─────────────────────────────────────────────────────
         with torch.no_grad():
             valid_q = all_q[all_q > -1e6]
             self.train_stats["loss"] = loss.item()
