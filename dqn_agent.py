@@ -1,15 +1,26 @@
 """
-DQN Agent for Tetris
+DQN Agent for Tetris — Placement-based action space
 
 Architecture:
-  - Conv layers process the 2-channel 20x10 grid (board + active piece)
-  - One-hot next piece is concatenated after conv layers
-  - Fully connected layers output Q(s, a) for all 6 actions
+  - Conv layers process the 1-channel 20x10 board
+  - Piece info (22 dims) concatenated after conv layers
+  - FC layers output Q(s, a) for all 96 possible placements
+  - Invalid actions are masked to -inf before argmax
 
 Key components:
   - Q-Network (online) and Target Network (frozen copy)
   - Experience Replay Buffer
-  - Epsilon-greedy exploration
+  - Epsilon-greedy exploration with action masking
+
+Action masking:
+  Not all 96 placement actions are valid in every state. Invalid actions
+  (piece doesn't fit, can't hold, etc.) are masked to -inf in Q-values.
+  This ensures the agent never picks an impossible action, and the masked
+  entries don't contribute to the max in the Bellman target.
+
+  Mathematically, the masked Bellman target is:
+      y = r + γ * max_{a' ∈ valid(s')} Q_θ⁻(s', a')
+  instead of max over all actions.
 """
 
 import torch
@@ -19,12 +30,16 @@ import numpy as np
 from collections import deque
 import random
 
-from tetris_env import NUM_ACTIONS, NUM_PIECES, ROWS, COLS
+from tetris_env import MAX_ACTIONS, NUM_PIECES, VISIBLE_ROWS, COLS
+
+
+# Piece info size: current(7) + next(7) + hold(7) + can_hold(1) = 22
+PIECE_INFO_SIZE = NUM_PIECES * 3 + 1
 
 
 class QNetwork(nn.Module):
     """
-    Maps state -> Q-values for all actions.
+    Maps state -> Q-values for all 96 placement actions.
 
     Why a CNN?
     ----------
@@ -35,18 +50,19 @@ class QNetwork(nn.Module):
     A CNN learns them once and applies them everywhere (weight sharing).
 
     Architecture choices:
+    - 1 input channel (just the board — no active piece in placement-based)
     - Small kernels (3x3) — Tetris features are local
     - Few layers — the board is only 20x10, not a 224x224 image
-    - Concatenate next_piece after convolutions — it's not spatial info
+    - Piece info concatenated after conv — it's not spatial data
     """
 
     def __init__(self):
         super().__init__()
 
         # Convolutional feature extractor for the 20x10 grid
-        # Input: (batch, 2, 20, 10) — 2 channels (board + active piece)
+        # Input: (batch, 1, 20, 10) — 1 channel (board state)
         self.conv = nn.Sequential(
-            nn.Conv2d(2, 32, kernel_size=3, padding=1),  # -> (32, 20, 10)
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),   # -> (32, 20, 10)
             nn.ReLU(),
             nn.Conv2d(32, 64, kernel_size=3, padding=1),  # -> (64, 20, 10)
             nn.ReLU(),
@@ -54,27 +70,26 @@ class QNetwork(nn.Module):
             nn.ReLU(),
         )
 
-        # After conv: flatten 64*20*10 = 12800, plus 7 for next piece
-        conv_out_size = 64 * ROWS * COLS
+        conv_out_size = 64 * VISIBLE_ROWS * COLS  # 12800
 
         self.fc = nn.Sequential(
-            nn.Linear(conv_out_size + NUM_PIECES, 512),
+            nn.Linear(conv_out_size + PIECE_INFO_SIZE, 512),
             nn.ReLU(),
-            nn.Linear(512, NUM_ACTIONS),
+            nn.Linear(512, MAX_ACTIONS),
         )
 
-    def forward(self, grid, next_piece):
+    def forward(self, board, piece_info):
         """
         Args:
-            grid: (batch, 2, 20, 10) float tensor
-            next_piece: (batch, 7) float tensor (one-hot)
+            board: (batch, 1, 20, 10) float tensor
+            piece_info: (batch, 22) float tensor
 
         Returns:
-            q_values: (batch, 6) — one Q-value per action
+            q_values: (batch, 96) — one Q-value per possible placement
         """
-        x = self.conv(grid)
-        x = x.view(x.size(0), -1)  # flatten
-        x = torch.cat([x, next_piece], dim=1)
+        x = self.conv(board)
+        x = x.view(x.size(0), -1)
+        x = torch.cat([x, piece_info], dim=1)
         return self.fc(x)
 
 
@@ -82,11 +97,12 @@ class ReplayBuffer:
     """
     Stores transitions (s, a, r, s', done) and samples random minibatches.
 
-    Why a fixed-size buffer?
-    -----------------------
-    We want recent-ish experience (the agent's behavior changes over time,
-    so very old transitions become less representative), but enough history
-    to decorrelate samples. 100k transitions is a common sweet spot.
+    Why experience replay?
+    ----------------------
+    Consecutive placements are correlated (similar board states). SGD
+    assumes i.i.d. samples — violating this causes unstable learning.
+    The replay buffer decorrelates training data by sampling uniformly
+    from a large pool of past transitions.
     """
 
     def __init__(self, capacity: int = 100_000):
@@ -99,16 +115,18 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
 
-        # Stack state components separately
-        grids = torch.FloatTensor(np.array([s["grid"] for s in states]))
-        next_pieces = torch.FloatTensor(
-            np.array([s["next_piece"] for s in states])
+        boards = torch.FloatTensor(np.array([s["board"] for s in states]))
+        piece_infos = torch.FloatTensor(
+            np.array([s["piece_info"] for s in states])
         )
-        next_grids = torch.FloatTensor(
-            np.array([s["grid"] for s in next_states])
+        next_boards = torch.FloatTensor(
+            np.array([s["board"] for s in next_states])
         )
-        next_next_pieces = torch.FloatTensor(
-            np.array([s["next_piece"] for s in next_states])
+        next_piece_infos = torch.FloatTensor(
+            np.array([s["piece_info"] for s in next_states])
+        )
+        next_masks = torch.FloatTensor(
+            np.array([s["action_mask"] for s in next_states])
         )
 
         actions = torch.LongTensor(actions)
@@ -116,10 +134,11 @@ class ReplayBuffer:
         dones = torch.FloatTensor(dones)
 
         return {
-            "grid": grids,
-            "next_piece": next_pieces,
-            "next_grid": next_grids,
-            "next_next_piece": next_next_pieces,
+            "board": boards,
+            "piece_info": piece_infos,
+            "next_board": next_boards,
+            "next_piece_info": next_piece_infos,
+            "next_mask": next_masks,
             "actions": actions,
             "rewards": rewards,
             "dones": dones,
@@ -131,29 +150,19 @@ class ReplayBuffer:
 
 class DQNAgent:
     """
-    The DQN agent. Brings together:
-      - Online Q-network (updated every step)
-      - Target Q-network (synced every target_update steps)
-      - Replay buffer
-      - Epsilon-greedy exploration
+    DQN agent with action masking for placement-based Tetris.
 
-    Epsilon-greedy exploration
-    -------------------------
-    With probability epsilon, take a random action.
-    With probability 1-epsilon, take argmax_a Q(s, a).
+    Epsilon-greedy exploration with masking
+    ----------------------------------------
+    With probability ε, pick a random VALID action (not any random action).
+    With probability 1-ε, pick argmax Q(s, a) over valid actions only.
 
-    Why? This is the exploration-exploitation tradeoff:
-    - Exploitation: act on what you know (greedy)
-    - Exploration: try random things to discover better strategies
+    The math: the behavior policy is
+        π(a|s) = (1-ε) * 1[a = argmax_{a'∈valid} Q(s,a')] + ε/|valid(s)|
+    where valid(s) is the set of valid actions in state s.
 
-    We anneal epsilon from 1.0 (fully random) to a small value (mostly
-    greedy) over training. Early on, the Q-values are garbage, so random
-    exploration is more useful. Later, we trust the learned Q-values.
-
-    The math: we want the agent's behavior policy to be
-        π(a|s) = (1-ε) * 1[a = argmax Q(s,a)] + ε/|A|
-    This guarantees every action has nonzero probability, which is
-    needed for convergence guarantees.
+    This still guarantees every valid action has nonzero probability,
+    preserving the exploration guarantees needed for convergence.
     """
 
     def __init__(
@@ -176,11 +185,8 @@ class DQNAgent:
         self.q_net = QNetwork().to(self.device)
         self.target_net = QNetwork().to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
-        self.target_net.eval()  # target net is never trained directly
+        self.target_net.eval()
 
-        # Optimizer — Adam is standard for DQN. It adapts learning rates
-        # per-parameter, which helps because different conv filters and
-        # FC weights can need very different step sizes.
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
 
         # Hyperparameters
@@ -203,79 +209,85 @@ class DQNAgent:
 
     def select_action(self, state: dict) -> int:
         """
-        Epsilon-greedy action selection.
+        Epsilon-greedy action selection over valid actions only.
 
-        Returns an action index (0-5).
+        Returns a valid action index (0-95).
         """
-        if random.random() < self.epsilon:
-            return random.randint(0, NUM_ACTIONS - 1)
+        mask = state["action_mask"]
+        valid_actions = np.where(mask > 0)[0]
+        assert len(valid_actions) > 0, "No valid actions available"
 
-        # Greedy: pick action with highest Q-value
+        if random.random() < self.epsilon:
+            return int(self.rng_choice(valid_actions))
+
+        # Greedy: pick valid action with highest Q-value
         with torch.no_grad():
-            grid = torch.FloatTensor(state["grid"]).unsqueeze(0).to(self.device)
-            next_piece = torch.FloatTensor(
-                state["next_piece"]
+            board = torch.FloatTensor(state["board"]).unsqueeze(0).to(self.device)
+            piece_info = torch.FloatTensor(
+                state["piece_info"]
             ).unsqueeze(0).to(self.device)
-            q_values = self.q_net(grid, next_piece)
-            return q_values.argmax(dim=1).item()
+            q_values = self.q_net(board, piece_info).squeeze(0)
+
+            # Mask invalid actions to -inf
+            mask_tensor = torch.FloatTensor(mask).to(self.device)
+            q_values[mask_tensor == 0] = -float("inf")
+
+            return q_values.argmax().item()
+
+    def rng_choice(self, arr):
+        """Pick a random element from arr."""
+        return arr[random.randint(0, len(arr) - 1)]
 
     def train_step(self) -> float | None:
         """
-        Sample a batch from replay buffer, compute loss, update weights.
+        Sample a batch, compute masked Bellman target, update weights.
 
-        The core DQN update in math:
+        The masked DQN update:
+            target = r + γ * max_{a' ∈ valid(s')} Q_θ⁻(s', a') * (1 - done)
+            loss = HuberLoss(Q_θ(s, a), target)
 
-            target = r + γ * max_a' Q_θ⁻(s', a') * (1 - done)
-            loss = (Q_θ(s, a) - target)²
-
-        The (1 - done) term: if the episode ended, there's no future reward.
-        The future value is 0, so the target is just r.
-
-        Returns the loss value (for logging) or None if buffer too small.
+        Action masking in the target is critical: without it, the max
+        would include Q-values for impossible placements, corrupting
+        the target signal.
         """
         if len(self.replay_buffer) < self.batch_size:
             return None
 
         batch = self.replay_buffer.sample(self.batch_size)
 
-        # Move everything to device
-        grids = batch["grid"].to(self.device)
-        next_pieces = batch["next_piece"].to(self.device)
-        next_grids = batch["next_grid"].to(self.device)
-        next_next_pieces = batch["next_next_piece"].to(self.device)
+        # Move to device
+        boards = batch["board"].to(self.device)
+        piece_infos = batch["piece_info"].to(self.device)
+        next_boards = batch["next_board"].to(self.device)
+        next_piece_infos = batch["next_piece_info"].to(self.device)
+        next_masks = batch["next_mask"].to(self.device)
         actions = batch["actions"].to(self.device)
         rewards = batch["rewards"].to(self.device)
         dones = batch["dones"].to(self.device)
 
-        # Q_θ(s, a) — get Q-value for the action that was actually taken
-        # q_net outputs (batch, 6), we index with the action to get (batch,)
-        q_values = self.q_net(grids, next_pieces)
+        # Q_θ(s, a) for the action that was taken
+        q_values = self.q_net(boards, piece_infos)
         q_values = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
 
-        # Target: r + γ * max_a' Q_θ⁻(s', a') * (1 - done)
+        # Masked target: r + γ * max_{valid} Q_θ⁻(s', a')
         with torch.no_grad():
-            next_q_values = self.target_net(next_grids, next_next_pieces)
+            next_q_values = self.target_net(next_boards, next_piece_infos)
+            # Mask invalid actions in next state to -inf
+            next_q_values[next_masks == 0] = -float("inf")
             max_next_q = next_q_values.max(dim=1)[0]
+            # If ALL actions are invalid (terminal state), max_next_q = -inf
+            # Clamp to 0 for terminal states
+            max_next_q = torch.clamp(max_next_q, min=-1e6)
             targets = rewards + self.gamma * max_next_q * (1 - dones)
 
-        # Huber loss (smooth L1) — less sensitive to outlier targets than MSE.
-        # Early in training, max_next_q can be wildly wrong, producing huge
-        # (target - prediction) values. MSE squares these, creating enormous
-        # gradients. Huber is quadratic for small errors, linear for large
-        # ones, so it's more robust:
-        #   L(δ) = 0.5δ²       if |δ| ≤ 1
-        #        = |δ| - 0.5    otherwise
+        # Huber loss — robust to outlier targets early in training
         loss = nn.functional.smooth_l1_loss(q_values, targets)
 
-        # Gradient descent step
         self.optimizer.zero_grad()
         loss.backward()
-        # Gradient clipping — prevents exploding gradients when the
-        # Q-value estimates are wildly off early in training
         nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=10.0)
         self.optimizer.step()
 
-        # Sync target network periodically
         self.steps_done += 1
         if self.steps_done % self.target_update == 0:
             self.target_net.load_state_dict(self.q_net.state_dict())

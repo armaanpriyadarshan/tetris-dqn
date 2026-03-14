@@ -4,25 +4,16 @@ Training loop for Tetris DQN.
 Usage:
     python train.py
 
-The training loop follows the standard DQN procedure:
-    1. Agent observes state s
-    2. Agent picks action a via ε-greedy
-    3. Environment returns (s', r, done)
-    4. Store transition (s, a, r, s', done) in replay buffer
-    5. Sample random minibatch from buffer, compute loss, gradient step
-    6. Periodically sync target network ← online network
+Each training step:
+    1. Agent observes state s (board + piece info + action mask)
+    2. Agent picks valid action a via masked ε-greedy
+    3. Environment places piece, clears lines, returns (s', r, done)
+    4. Store transition in replay buffer
+    5. Sample minibatch, compute masked Bellman target, gradient step
+    6. Periodically sync target network
 
-Why train on random minibatches instead of the latest transition?
---------------------------------------------------------------
-Consecutive Tetris frames are highly correlated (the board barely changes
-between steps). Training on correlated data violates the i.i.d. assumption
-that SGD relies on, leading to unstable learning or divergence. The replay
-buffer breaks this correlation by letting us sample uniformly from a large
-pool of past experience.
-
-This is one of the two key innovations of DQN (Mnih et al., 2015):
-    1. Experience replay (decorrelates training data)
-    2. Target network (stabilizes the moving target in the Bellman update)
+With placement-based actions, each step = one piece placed. Episodes are
+shorter but each step is more information-dense than step-by-step control.
 """
 
 import time
@@ -38,7 +29,7 @@ def train(
     num_episodes: int = 10_000,
     log_interval: int = 50,
     save_interval: int = 500,
-    render_interval: int = 0,  # set > 0 to print board every N episodes
+    render_interval: int = 0,
 ):
     env = TetrisEnv()
     agent = DQNAgent()
@@ -48,7 +39,7 @@ def train(
     print(f"Epsilon decay over {agent.epsilon_decay} steps")
     print()
 
-    # Rolling stats for logging
+    # Rolling stats
     recent_rewards = deque(maxlen=log_interval)
     recent_lengths = deque(maxlen=log_interval)
     recent_lines = deque(maxlen=log_interval)
@@ -91,32 +82,31 @@ def train(
             elapsed = time.time() - start_time
 
             print(
-                f"Episode {episode:>6d} | "
+                f"Ep {episode:>6d} | "
                 f"Steps {total_steps:>8d} | "
                 f"ε {agent.epsilon:.3f} | "
                 f"Reward {avg_reward:>7.2f} | "
                 f"Lines {avg_lines:>5.1f} | "
-                f"Length {avg_length:>6.1f} | "
+                f"Pieces {avg_length:>5.1f} | "
                 f"Loss {avg_loss:.4f} | "
-                f"Time {elapsed:>6.0f}s"
+                f"{elapsed:>5.0f}s"
             )
 
-            # Track improvement
             if avg_reward > best_avg_reward:
                 best_avg_reward = avg_reward
                 torch.save(agent.q_net.state_dict(), "best_model.pt")
 
         # ── Render ────────────────────────────────────────────────────
         if render_interval > 0 and episode % render_interval == 0:
-            # Play one episode greedily (no exploration) and show final board
             test_state = env.reset()
-            old_eps = agent.epsilon_end
-            agent.epsilon_end = 0.0  # force greedy
+            old_eps_end = agent.epsilon_end
+            agent.epsilon_end = 0.0
             while not env.done:
                 a = agent.select_action(test_state)
                 test_state, _, _, test_info = env.step(a)
-            agent.epsilon_end = old_eps
-            print(f"\n--- Greedy eval: {test_info['lines_cleared']} lines ---")
+            agent.epsilon_end = old_eps_end
+            print(f"\n--- Greedy eval: {test_info['lines_cleared']} lines, "
+                  f"score {test_info['score']} ---")
             print(env.render())
             print()
 
@@ -128,11 +118,9 @@ def train(
                 "q_net_state": agent.q_net.state_dict(),
                 "target_net_state": agent.target_net.state_dict(),
                 "optimizer_state": agent.optimizer.state_dict(),
-                "epsilon_decay": agent.epsilon_decay,
                 "steps_done": agent.steps_done,
             }, f"checkpoint_{episode}.pt")
 
-    # Final save
     torch.save(agent.q_net.state_dict(), "final_model.pt")
     print(f"\nTraining complete. Best avg reward: {best_avg_reward:.2f}")
 
