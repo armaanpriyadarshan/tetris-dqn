@@ -1,0 +1,2 @@
+{"episode": 3, "total_steps": 144, "elapsed_s": 6.4, "epsilon": 0.9984, "avg_reward": 4.313, "avg_lines": 2.33, "avg_pieces": 48.0, "avg_score": 766.7, "avg_loss": 0.01326, "avg_q": 0.0325, "max_q": 4.205, "avg_grad_norm": 0.2187, "buffer_size": 144}
+{"episode": 6, "total_steps": 323, "elapsed_s": 20.3, "epsilon": 0.9949, "avg_reward": 14.597, "avg_lines": 6.67, "avg_pieces": 59.7, "avg_score": 1966.7, "avg_loss": 0.02117, "avg_q": 0.0638, "max_q": 4.8095, "avg_grad_norm": 0.2735, "buffer_size": 323}
