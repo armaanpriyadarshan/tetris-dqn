@@ -527,7 +527,8 @@ class TetrisEnv:
           board_features: (34,)       — engineered features for MLP processing
           action_mask:    (96,)       — which placements are valid
         """
-        board = self.board[HIDDEN_ROWS:].copy().reshape(1, VISIBLE_ROWS, COLS)
+        board = (self.board[HIDDEN_ROWS:] > 0).astype(np.float32).reshape(
+            1, VISIBLE_ROWS, COLS)
 
         current_oh = np.zeros(NUM_PIECES, dtype=np.float32)
         current_oh[self.current_piece] = 1.0
@@ -598,7 +599,7 @@ class TetrisEnv:
         assert drop_row >= 0
 
         for r, c in self._get_cells(piece_idx, rotation, drop_row, col):
-            self.board[r, c] = 1.0
+            self.board[r, c] = float(piece_idx + 1)  # 1-7 for piece colors
 
         # ── T-spin, clear, perfect ────────────────────────────────────
         tspin_type = self._check_tspin(piece_idx, rotation, drop_row, col)

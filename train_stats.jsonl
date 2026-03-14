@@ -1,2 +1,1 @@
-{"episode": 3, "steps": 167, "time": 10.8, "epsilon": 0.9979, "reward": -110.777, "lines": 5.0, "pieces": 55.7, "score": 1633.3, "loss": 0.29766, "q_mean": -1.6864, "q_max": 5.863, "grad_norm": 1.8723, "holes": 38.0, "height": 20.0, "buffer": 167}
-{"episode": 6, "steps": 304, "time": 23.6, "epsilon": 0.9952, "reward": -100.36, "lines": 1.67, "pieces": 45.7, "score": 400.0, "loss": 0.19713, "q_mean": -1.8071, "q_max": 8.2693, "grad_norm": 1.6669, "holes": 41.33, "height": 20.0, "buffer": 304}
+{"episode": 50, "steps": 2435, "time": 123.9, "epsilon": 0.953, "reward": -99.823, "lines": 2.64, "pieces": 48.7, "score": 854.0, "loss": 0.09334, "q_mean": -1.8445, "q_max": 6.9869, "grad_norm": 1.8745, "holes": 40.54, "height": 20.0, "buffer": 2435}
